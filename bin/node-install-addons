@@ -850,10 +850,19 @@ const fetchAssetList = (() => {
   };
 })();
 
-const buildOnly = [
-  'true',
-  process.env.npm_package_name,
-].includes(process.env.npm_config_build_from_source);
+let buildOnly = false;
+if (process.env.npm_config_build_from_source) {
+  switch (process.env.npm_config_build_from_source) {
+    case 'true':
+      buildOnly = true;
+      break;
+    default: {
+      buildOnly = process.env.npm_package_name.split(',').includes(
+        process.env.npm_package_name
+      );
+    }
+  }
+}
 const noBuildOutput = (process.env.npm_config_silent_build === 'true');
 const fallbackBuild = (process.env.npm_config_fallback_to_build === 'true');
 const overrideArch = process.env.npm_config_override_arch;
