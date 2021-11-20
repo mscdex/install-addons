@@ -918,13 +918,8 @@ const buildDeps = [];
   }
 }
 
-if (buildOnly || (typeof binaryRepo !== 'string' || !binaryRepo))
-  return tryBuild();
-
-if (typeof pkgVer !== 'string' || !pkgVer) {
-  log('Missing package version string value');
-  return tryBuild(true);
-}
+if (typeof pkgVer !== 'string' || !pkgVer)
+  throw new Error('Missing package version');
 
 // Format: v{version}-m{moduleABIVer}-n{napiVer}-{os}-{libc}-{arch}
 const RE_BINARY_FILENAME = new RegExp(
@@ -936,31 +931,29 @@ const RE_BINARY_FILENAME = new RegExp(
     + escapeRegExp(localArch)
 );
 
-if (!/^[^/]+\/[^/]+$/.test(binaryRepo)) {
-  log(`Malformed binaryRepo value: ${binaryRepo}`);
-  return tryBuild(true);
-}
+if (!/^[^/]+\/[^/]+$/.test(binaryRepo))
+  throw new Error(`Malformed binaryRepo value: ${binaryRepo}`);
 
-if (typeof binaryPath !== 'string' || !binaryPath) {
-  log('Missing binaryOutPath string value');
-  return tryBuild(true);
-}
+if (typeof binaryPath !== 'string' || !binaryPath)
+  throw new Error('Missing binaryOutPath string value');
 
 if (!isAbsolute(binaryPath))
   binaryPath = resolve(process.cwd(), binaryPath);
 
-// Prepare the directory where the binary will be stored
+// Prepare the directory where the binary/minbuild will be stored
 {
   const binaryDir = dirname(binaryPath);
   try {
     mkdirSync(binaryDir, { recursive: true });
   } catch (ex) {
-    log(
+    throw new Error(
       `Unable to create binary directory (${binaryDir}): ${ex.message}`
     );
-    return tryBuild(true);
   }
 }
+
+if (buildOnly)
+  return tryBuild();
 
 // Get the system OS version
 if (localOSVer === undefined)
