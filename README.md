@@ -69,15 +69,19 @@ CLI Parameters
 * `--fallback-to-build` - Attempts to build the addon locally if a binary cannot
   be found.
 
-* `--build-from-source` - 
+* `--build-from-source[=<string>]` - If a string value is given, it builds from
+  source only for the specified (comma-separated) packages that
+  use `install-addons`.
 
-* `--silent-build` - 
+* `--silent-build` - Be less noisy with log output
 
-* `--override-arch` - 
+* `--override-arch=<string>` - String containing the arch name
 
-* `--override-libc` - name or {name}_{major.minor}
+* `--override-libc=<string>` - String containing the libc name
+  or `{name}_{major.minor}`
 
-* `--override-platform` - name or {name}_{major.minor}
+* `--override-platform=<string>` - String containing the platform name
+  or `{name}_{major.minor}`
 
 
 [build-addons]: https://github.com/mscdex/build-addons
