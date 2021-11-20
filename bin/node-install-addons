@@ -754,26 +754,28 @@ const fetchAssetList = (() => {
           continue;
         }
 
-        // Addon binary file?
-        m = /[.]node([.]gz)?$/.exec(filename);
-        if (m) {
-          if (m[1] !== undefined) {
-            // .gz files should be the right type
-            if (contentType !== 'application/gzip')
+        if (!buildOnly) {
+          // Addon binary file?
+          m = /[.]node([.]gz)?$/.exec(filename);
+          if (m) {
+            if (m[1] !== undefined) {
+              // .gz files should be the right type
+              if (contentType !== 'application/gzip')
+                continue;
+            } else if (contentType !== 'application/octet-stream') {
               continue;
-          } else if (contentType !== 'application/octet-stream') {
+            }
+            if (isSuitableBinary(filename)) {
+              binaries.push({
+                downloadURL,
+                contentType,
+                filename,
+                size: asset.size,
+                sumURL: null,
+              });
+            }
             continue;
           }
-          if (isSuitableBinary(filename)) {
-            binaries.push({
-              downloadURL,
-              contentType,
-              filename,
-              size: asset.size,
-              sumURL: null,
-            });
-          }
-          continue;
         }
 
         // Minbuild archive?
