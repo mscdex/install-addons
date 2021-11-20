@@ -1,0 +1,1079 @@
+#!/usr/bin/env node
+'use strict';
+
+const { execFileSync, spawnSync } = require('child_process');
+const { createHash } = require('crypto');
+const {
+  createWriteStream,
+  mkdirSync,
+  unlinkSync,
+} = require('fs');
+const http = require('http');
+const https = require('https');
+const { release: getOSRelease } = require('os');
+const {
+  dirname,
+  isAbsolute,
+  join,
+  resolve,
+  win32: {
+    join: win32Join,
+  },
+} = require('path');
+const { Transform, Writable } = require('stream');
+const { createGunzip } = require('zlib');
+
+const tar = require('tar');
+
+const MAX_REDIRECTS = 5;
+
+const RE_VER_MAJOR_MINOR = /^(\d+)[.](\d+)/;
+
+function log(...args) {
+  console.log('[install-addons]', ...args);
+}
+
+const BASE_REGS = [
+  'HKLM\\SOFTWARE\\Wow6432Node\\Microsoft\\VisualStudio',
+  'HKLM\\SOFTWARE\\Microsoft\\VisualStudio',
+];
+const SUFFIX_REG = (() => {
+  let arch;
+  if (/^arm/.test(process.arch))
+    arch = 'ARM';
+  else if (process.arch === 'ia32')
+    arch = 'X86';
+  else
+    arch = process.arch.toUpperCase();
+
+  return `\\VC\\Runtimes\\${arch}`;
+})();
+
+const execOpts = {
+  encoding: 'utf8',
+  stdio: ['ignore', 'pipe', 'pipe'],
+  windowsHide: true,
+};
+
+let regExe;
+if (process.env.SystemRoot)
+  regExe = win32Join(process.env.SystemRoot, 'System32', 'reg.exe');
+
+function getVCRuntimeInstalledVer(regPath, use32) {
+  const extraArgs = (use32 ? [ '/reg:32' ] : []);
+  const args = [ 'query', regPath, ...extraArgs ];
+  const regexp =
+    /^[ \t]+(Version|Installed)[ \t]+REG_[^ \t]+[ \t]+([^ \t].+)$/img;
+  const kv = new Map();
+
+  try {
+    const out = execFileSync(regExe, args, execOpts);
+    let m;
+    while (m = regexp.exec(out)) {
+      const key = m[1].toLowerCase();
+      // Make sure we don't get duplicates in case of subkeys
+      if (kv.has(key))
+        break;
+      kv.set(key, m[2]);
+    }
+  } catch {}
+
+  const fullVersion = kv.get('version');
+  const installed = kv.get('installed');
+
+  if (installed
+      && installed.toLowerCase() === '0x1'
+      && fullVersion
+      && fullVersion.length) {
+    return fullVersion;
+  }
+
+  return null;
+}
+
+function getVCRuntimeVersions(base, use32) {
+  const extraArgs = (use32 ? [ '/reg:32' ] : []);
+  const args = [ 'query', base, ...extraArgs ];
+  const regexp = /^HK.+\\([\d]+[.][\d]+)$/img;
+  const results = new Map();
+
+  try {
+    const out = execFileSync(regExe, args, execOpts);
+    let m;
+    while (m = regexp.exec(out))
+      results.set(m[1], m[0]);
+  } catch {}
+
+  return results;
+}
+
+const getVCRuntimes = (() => {
+  let cache;
+  return () => {
+    if (cache !== undefined)
+      return cache;
+
+    const runtimes = new Map();
+
+    for (const use32 of [true, false]) {
+      for (const base of BASE_REGS) {
+        const versions = getVCRuntimeVersions(base, use32);
+        for (const [, regPath] of versions) {
+          const fullVer = getVCRuntimeInstalledVer(regPath + SUFFIX_REG, use32);
+          if (fullVer !== null)
+            runtimes.set(fullVer, true);
+        }
+      }
+    }
+
+    const ret = [];
+    for (const fullVer of runtimes.keys()) {
+      const m = /^v(\d+)[.](\d+)/.exec(fullVer);
+      if (m) {
+        // MS currently implies a trailing zero in the minor version when there
+        // is only one digit, so we make that adjustment here.
+        let minor = +m[2];
+        if (minor < 10)
+          minor *= 10;
+
+        ret.push({ major: +m[1], minor: +m[2] });
+      }
+    }
+    return (cache = ret);
+  };
+})();
+
+function escapeRegExp(string) {
+  return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function versionMatches(localMajor, localMinor, remoteMajor, remoteMinor) {
+  return (localMajor > remoteMajor
+          || (localMajor === remoteMajor
+              && localMinor >= remoteMinor));
+}
+
+function isCompatibleLibc(remoteName, remoteMajor, remoteMinor) {
+  if (localLibc !== remoteName)
+    return false;
+
+  switch (localOS) {
+    case 'win32': {
+      // MS currently implies a trailing zero in the minor version when there
+      // is only one digit, so we make that adjustment here.
+      if (remoteMinor < 10)
+        remoteMinor *= 10;
+
+      const localVCVersions = getVCRuntimes();
+      for (const localVer of localVCVersions) {
+        if (versionMatches(localVer.major,
+                           localVer.minor,
+                           remoteMajor,
+                           remoteMinor)) {
+          return true;
+        }
+      }
+      break;
+    }
+    default:
+      return versionMatches(localLibcVer.major,
+                            localLibcVer.minor,
+                            remoteMajor,
+                            remoteMinor);
+  }
+
+  return false;
+}
+
+function parseBinaryFilename(filename) {
+  const m = RE_BINARY_FILENAME.exec(filename);
+  if (!m)
+    return;
+
+  let f = 1;
+  return {
+    napiVer: +m[f++],
+    osName: m[f++],
+    osMajor: +m[f++],
+    osMinor: +m[f++],
+    libcName: m[f++],
+    libcMajor: +m[f++],
+    libcMinor: +m[f++],
+  };
+}
+
+function isSuitableBinary(filename) {
+  const info = parseBinaryFilename(filename);
+  if (!info)
+    return false;
+
+  const {
+    napiVer,
+    osName,
+    osMajor,
+    osMinor,
+    libcName,
+    libcMajor,
+    libcMinor,
+  } = info;
+
+  // Check napi version (if applicable)
+  if (usesNapi && napiVer > localNapiVer)
+    return false;
+
+  // Check OS
+  if (localOS !== osName
+      || localOSVer.major < osMajor
+      || (localOSVer.major === osMajor && localOSVer.minor < osMinor)) {
+    return false;
+  }
+
+  // Check C/C++ runtime
+  return isCompatibleLibc(libcName, libcMajor, libcMinor);
+}
+
+function getOSVer() {
+  let ver;
+  switch (localOS) {
+    case 'darwin': {
+      const result = spawnSync('sw_vers -productVersion', {
+        shell: true,
+        encoding: 'utf8',
+      });
+      if (result !== 0)
+        return;
+      ver = result.stdout.trim();
+      break;
+    }
+    default:
+      ver = getOSRelease();
+  }
+  const m = RE_VER_MAJOR_MINOR.exec(ver);
+  if (m)
+    return { major: +m[1], minor: +m[2] };
+}
+
+function fetchMinbuild(minbuild, cb) {
+  cb = once(cb);
+  const tmpBaseDir = resolve(process.cwd(), 'build');
+  // TODO: ensure `tmpDir` exists
+  const filePath = join(tmpBaseDir, 'minbuild.tar.gz');
+
+  // First fetch the checksum
+  log('Fetching minbuild checksum...');
+  fetch(minbuild.sumURL, {}, [null, 'text/plain'], 0, (err, sum) => {
+    if (err)
+      return cb(err);
+
+    if (sum.length !== 64)
+      return cb(new Error(`Wrong minbuild checksum length: ${sum.length}`));
+
+    sum = sum.toString('utf8');
+
+    const hash = createHash('sha256');
+    let calcSum;
+    let calcSize = 0;
+    const checksummer = new Transform({
+      transform(chunk, encoding, callback) {
+        calcSize += chunk.length;
+        hash.update(chunk);
+        this.push(chunk);
+        callback();
+      },
+      flush(callback) {
+        calcSum = hash.digest('hex');
+        callback();
+      }
+    });
+
+    const fileWS = createWriteStream(filePath);
+    fileWS.on('error', cb).on('close', () => {
+      if (minbuild.size !== calcSize)
+        return cb(new Error('minbuild size mismatch'));
+      if (sum !== calcSum)
+        return cb(new Error('minbuild checksum mismatch'));
+      let err;
+      try {
+        tar.extract({
+          sync: true,
+          file: filePath,
+          cwd: process.cwd(),
+          newer: false,
+          keep: false,
+          preservePaths: false,
+          unlink: false,
+          preserveOwner: false,
+          noMtime: false,
+          noChmod: false,
+        });
+      } catch (ex) {
+        err = ex;
+      }
+
+      try {
+        unlinkSync(filePath);
+      } catch {}
+
+      if (err)
+        return cb(new Error(`Error extracting minbuild: ${err.message}`));
+
+      cb();
+    });
+
+    checksummer.pipe(fileWS);
+
+    // Now download the minbuild while simultaneously calculating its checksum
+    log('Fetching minbuild...');
+    const { downloadURL: url } = minbuild;
+    fetch(url, {}, [checksummer, 'application/gzip'], 0, (err) => {
+      if (err)
+        return cb(err);
+    });
+  });
+}
+
+// TODO: DRY with `fetchMinbuild()` ?
+function fetchBinary(binary, cb) {
+  cb = once(cb);
+
+  // First fetch the checksum
+  log('Fetching binary checksum...');
+  fetch(binary.sumURL, {}, [null, 'text/plain'], 0, (err, sum) => {
+    if (err)
+      return cb(err);
+
+    if (sum.length !== 64)
+      return cb(new Error(`Wrong binary checksum length: ${sum.length}`));
+
+    sum = sum.toString('utf8');
+
+    const hash = createHash('sha256');
+    let calcSum;
+    let calcSize = 0;
+    const checksummer = new Transform({
+      transform(chunk, encoding, callback) {
+        calcSize += chunk.length;
+        hash.update(chunk);
+        this.push(chunk);
+        callback();
+      },
+      flush(callback) {
+        calcSum = hash.digest('hex');
+        callback();
+      }
+    });
+
+    let gunzip;
+    if (binary.contentType === 'application/gzip') {
+      gunzip = createGunzip();
+      gunzip.on('error', cb);
+    }
+
+    const fileWS = createWriteStream(binaryPath);
+    fileWS.on('error', cb).on('close', () => {
+      if (binary.size !== calcSize)
+        return cb(new Error('binary size mismatch'));
+      if (sum !== calcSum)
+        return cb(new Error('binary checksum mismatch'));
+      cb();
+    });
+
+    if (gunzip)
+      checksummer.pipe(gunzip).pipe(fileWS);
+    else
+      checksummer.pipe(fileWS);
+
+    // Now download the binary while simultaneously calculating its checksum
+    log('Fetching binary...');
+    const { downloadURL: url } = binary;
+    fetch(url, {}, [checksummer, 'application/gzip'], 0, (err) => {
+      if (err)
+        return cb(err);
+    });
+  });
+}
+
+function tryBuild(isFallback) {
+  const inheritStdio = [ 'ignore', 'inherit', 'inherit' ];
+
+  if (isFallback) {
+    if (!fallbackBuild) {
+      log('No binary available, module installation failed');
+      process.exit(1);
+    }
+    log('Falling back to build ...');
+  }
+
+  if (typeof buildCommand !== 'string' || !buildCommand) {
+    log('Missing build command');
+    process.exit(1);
+  }
+
+  if (noMinbuild) {
+    log('Skipping minbuild check');
+    continueBuild();
+  } else {
+    log('Checking for available minbuild...');
+    fetchAssetList((err, release) => {
+      if (err) {
+        log(`An error occurred while checking for minbuild: ${err.message}`);
+        process.exit(1);
+        return;
+      }
+
+      const { minbuild } = release;
+      if (!minbuild) {
+        log('No minbuild available, proceeding with build...');
+        continueBuild();
+        return;
+      }
+
+      log('Fetching minbuild...');
+      fetchMinbuild(minbuild, (err) => {
+        if (err) {
+          log(`An error occurred while retrieving minbuild: ${err.message}`);
+          process.exit(1);
+          return;
+        }
+
+        log('Minbuild transferred, proceeding with build...');
+        continueBuild();
+      });
+    });
+  }
+
+  function continueBuild() {
+    log('Installing build dependencies ...');
+    if (buildDeps.length > 0) {
+      if (typeof npmPath !== 'string' || !npmPath) {
+        log('Did not detect path to npm, giving up');
+        process.exit(1);
+      }
+      const result = spawnSync(npmPath, [ 'install', ...buildDeps ], {
+        windowsHide: true,
+        stdio: inheritStdio,
+      });
+      if (result.status !== 0) {
+        log('Installation of build dependencies failed!');
+        process.exit(1);
+      }
+    }
+
+    if (typeof prebuildCommand === 'string' && prebuildCommand) {
+      log('Running pre-build command ...');
+      const result = spawnSync(prebuildCommand, {
+        shell: true,
+        windowsHide: true,
+        stdio: (noBuildOutput ? 'ignore' : inheritStdio),
+      });
+      if (result.status !== 0) {
+        log('Pre-build command failed!');
+        process.exit(1);
+      }
+    }
+
+    log('Building from source ...');
+    const result = spawnSync(buildCommand, {
+      shell: true,
+      windowsHide: true,
+      stdio: (noBuildOutput ? 'ignore' : inheritStdio),
+    });
+    if (result.status !== 0) {
+      log('Building from source failed!');
+      process.exit(1);
+    }
+  }
+}
+
+function once(fn) {
+  if (typeof fn !== 'function')
+    throw new TypeError('Argument must be a function');
+  return (...args) => {
+    if (fn === null)
+      return;
+    const fn_ = fn;
+    fn = null;
+    return fn_(...args);
+  };
+}
+
+function fetch(urlStr, headers, outPath, redirCount, callback) {
+  let inType;
+  if (Array.isArray(outPath) && outPath.length === 2) {
+    inType = outPath[1];
+    outPath = outPath[0];
+  }
+  if (outPath !== undefined
+      && outPath !== null
+      && (typeof outPath !== 'string' || !outPath)
+      && !(outPath instanceof Writable)) {
+    throw new TypeError(
+      'Output argument must be a non-empty path string '
+        + 'or Writable stream if specified'
+    );
+  }
+  let req;
+  let res;
+  let result;
+  let ws;
+  let ignoreCb = false;
+  const cleanup = () => {
+    try {
+      res.destroy();
+    } catch {}
+
+    try {
+      req.socket.destroy();
+    } catch {}
+
+    if (ws) {
+      try {
+        ws.destroy();
+      } catch {}
+      try {
+        unlinkSync(outPath);
+      } catch {}
+    }
+  };
+  const cb = once((err) => {
+    if (err || ignoreCb) {
+      cleanup();
+
+      if (ignoreCb)
+        return;
+
+      return callback(err);
+    }
+
+    callback(null, result);
+  });
+
+  let url;
+  try {
+    url = new URL(urlStr);
+  } catch {
+    return cb(new Error(`Invalid URL: ${urlStr}`));
+  }
+
+  let fn;
+  switch (url.protocol) {
+    case 'http:':
+      fn = http.get;
+      break;
+    case 'https:':
+      fn = https.get;
+      break;
+    default:
+      return cb(new Error(
+        `Unsupported protocol ${url.protocol} for ${urlStr}`
+      ));
+  }
+
+  if (!headers)
+    headers = {};
+
+  headers = { 'User-Agent': 'curl/7.58.0', ...headers };
+
+  req = fn(url, { headers }, (res_) => {
+    res = res_;
+    res.on('error', cb);
+
+    if (res.statusCode === 200) {
+      const contentType = res.headers['content-type'];
+      if (!outPath) {
+        const isJSON = /application\/json/i.test(contentType);
+        const isText = /text\/plain/i.test(contentType);
+        if ((inType === 'application/json' && !isJSON)
+            || (inType === 'text/plain' && !isText)) {
+          cb(new Error(`Unexpected Content-Type in response: ${contentType}`));
+          return;
+        }
+        if (!inType) {
+          const buf = [];
+          let nb = 0;
+          res.on('data', (chunk) => {
+            buf.push(chunk);
+            nb += chunk.length;
+          }).on('end', () => {
+            result = Buffer.concat(buf, nb);
+            cb();
+          });
+          return;
+        }
+        let buf = '';
+        res.on('data', (chunk) => {
+          buf += chunk;
+        }).on('end', () => {
+          if (isJSON) {
+            try {
+              result = JSON.parse(buf);
+            } catch (ex) {
+              return cb(ex);
+            }
+          } else {
+            result = buf;
+          }
+          cb();
+        }).setEncoding('utf8');
+        return;
+      }
+
+      switch (contentType) {
+        case 'application/gzip':
+        case 'application/octet-stream':
+          break;
+        default:
+          cb(new Error(`Unsupported Content-Type in response: ${contentType}`));
+          return;
+      }
+
+      if (typeof outPath !== 'string') {
+        // Assume writable stream
+        ws = outPath;
+        ws.on('error', cb);
+        ws.on('close', () => {
+          result = outPath;
+          cb();
+        });
+      } else {
+        try {
+          ws = createWriteStream(outPath);
+          ws.on('error', cb);
+          ws.on('close', () => {
+            result = outPath;
+            cb();
+          });
+        } catch (ex) {
+          return cb(ex);
+        }
+        if (inType === 'application/gzip') {
+          const gz = createGunzip();
+          gz.on('error', cb);
+          res.pipe(gz).pipe(ws);
+          return;
+        }
+      }
+
+      res.pipe(ws);
+      return;
+    }
+
+    if ([301, 302, 303, 307, 308].includes(res.statusCode)) {
+      const location = res.headers.location;
+      if (typeof location !== 'string' || !location)
+        return cb(new Error('Received redirect without location'));
+      if (redirCount === MAX_REDIRECTS)
+        return cb(new Error('Reached max redirects'));
+      ignoreCb = true;
+      cleanup();
+      //~ log(`Following redirect to: ${location}`);
+      let outPath_;
+      if (outPath)
+        outPath_ = [ outPath, inType ];
+      return fetch(location, headers, outPath_, redirCount + 1, callback);
+    }
+
+    if (res.statusCode === 404)
+      return cb(new Error('URL not found'));
+
+    cb(new Error(`Received unexpected status code: ${res.statusCode}`));
+  }).on('error', cb);
+}
+
+const fetchAssetList = (() => {
+  let cache;
+  return (cb) => {
+    if (cache)
+      return process.nextTick(cb, null, cache);
+
+    const apiURL =
+      `https://api.github.com/repos/${binaryRepo}/releases/tags/v${pkgVer}`;
+
+    const headers = {
+      'Accept': 'application/vnd.github.v3+json',
+    };
+    log(`Fetching release info at ${apiURL}`);
+    fetch(apiURL, headers, [null, 'application/json'], 0, once((err, obj) => {
+      if (err) {
+        const msg = err.message;
+        log(
+          `Failed to retrieve release info (${apiURL}): ${msg}`
+        );
+        return tryBuild(true);
+      }
+
+      if (typeof obj !== 'object' || obj === null) {
+        log(
+          `Received unexpected release info response type: ${typeof obj}`
+        );
+        return tryBuild(true);
+      }
+
+      if (!Array.isArray(obj.assets) || obj.assets.length === 0) {
+        log('Release contains no assets');
+        return tryBuild(true);
+      }
+
+      if (obj.draft === true) {
+        log('Release is a draft, aborting');
+        return tryBuild(true);
+      }
+
+      if (obj.prerelease === true) {
+        log('Release is a pre-release, aborting');
+        return tryBuild(true);
+      }
+
+      const RE_MINBUILD_FILENAME =
+        new RegExp(`^v${pkgVer}-minbuild[.]tar[.]gz$`);
+      const sums = new Map();
+      let binaries = [];
+      let minbuild;
+      for (const asset of obj.assets) {
+        const filename = asset.name;
+        const downloadURL = asset.browser_download_url;
+        const contentType = asset.content_type;
+
+        // Discard incomplete and/or empty files
+        if (asset.state !== 'uploaded'
+            || asset.size <= 0
+            || typeof filename !== 'string'
+            || !filename
+            || typeof downloadURL !== 'string'
+            || !downloadURL) {
+          continue;
+        }
+
+        // Checksum file?
+        let m = /^(.+)[.]sha256sum$/i.exec(filename);
+        if (m) {
+          // Checksum file
+          // sha256 is 32 bytes raw but 64 bytes ASCII hex
+          if (asset.size === 64)
+            sums.set(m[1], downloadURL);
+          continue;
+        }
+
+        // Addon binary file?
+        m = /[.]node([.]gz)?$/.exec(filename);
+        if (m) {
+          if (m[1] !== undefined) {
+            // .gz files should be the right type
+            if (contentType !== 'application/gzip')
+              continue;
+          } else if (contentType !== 'application/octet-stream') {
+            continue;
+          }
+          if (isSuitableBinary(filename)) {
+            binaries.push({
+              downloadURL,
+              contentType,
+              filename,
+              size: asset.size,
+              sumURL: null,
+            });
+          }
+          continue;
+        }
+
+        // Minbuild archive?
+        m = RE_MINBUILD_FILENAME.exec(filename);
+        if (m && contentType === 'application/gzip') {
+          minbuild = {
+            downloadURL,
+            filename,
+            size: asset.size,
+            sumURL: null,
+          };
+        }
+      }
+
+      // Ensure we have minbuild checksum if we have a minbuild archive
+      if (minbuild) {
+        const sumURL = sums.get(minbuild.filename);
+        if (sumURL)
+          minbuild.sumURL = sumURL;
+        else
+          minbuild = undefined;
+      }
+
+      // Only consider binaries we have checksums for
+      if (binaries.length) {
+        binaries = binaries.filter((f) => {
+          const sumURL = sums.get(f.filename);
+          if (sumURL) {
+            f.sumURL = sumURL;
+            return true;
+          }
+          return false;
+        });
+      }
+
+      // Sort the list of binaries from most preferable to least preferable
+      // (napi version descending, OS version descending, and then libc version
+      // descending) and then use the most preferable binary
+      if (binaries.length) {
+        binaries = binaries.sort((a, b) => {
+          // Because the binaries in this array have already passed
+          // `isSuitableBinary()`, we don't have to worry about the return value
+          // of `parseBinaryFilename()` or check/compare the OS or libc names
+          const infoA = parseBinaryFilename(a.filename);
+          const infoB = parseBinaryFilename(b.filename);
+
+          if (infoA.napiVer < infoB.napiVer)
+            return 1;
+          else if (infoA.napiVer > infoB.napiVer)
+            return -1;
+          else if (infoA.osMajor < infoB.osMajor)
+            return 1;
+          else if (infoA.osMajor > infoB.osMajor)
+            return -1;
+          else if (infoA.osMinor < infoB.osMinor)
+            return 1;
+          else if (infoA.osMinor > infoB.osMinor)
+            return -1;
+          else if (infoA.libcMajor < infoB.libcMajor)
+            return 1;
+          else if (infoA.libcMajor > infoB.libcMajor)
+            return -1;
+          else if (infoA.libcMinor < infoB.libcMinor)
+            return 1;
+          else if (infoA.libcMinor > infoB.libcMinor)
+            return -1;
+          return 0;
+        });
+      }
+
+      cache = { minbuild, binaries };
+      cb(null, cache);
+    }));
+  };
+})();
+
+const buildOnly = [
+  'true',
+  process.env.npm_package_name,
+].includes(process.env.npm_config_build_from_source);
+const noBuildOutput = (process.env.npm_config_silent_build === 'true');
+const fallbackBuild = (process.env.npm_config_fallback_to_build === 'true');
+const overrideArch = process.env.npm_config_override_arch;
+const overrideLibc = process.env.npm_config_override_libc;
+const overridePlatform = process.env.npm_config_override_platform;
+const npmPath = process.env.npm_execpath;
+const pkgVer = process.env.npm_package_version;
+const binaryRepo = process.env.npm_package_install_addons_binaryRepo;
+let binaryPath = process.env.npm_package_install_addons_binaryOutPath;
+const prebuildCommand = process.env.npm_package_install_addons_preBuildCommand;
+const buildCommand = process.env.npm_package_install_addons_buildCommand;
+const noMinbuild = (
+  process.env.npm_package_install_addons_noMinbuild === 'true'
+);
+const usesNapi = (process.env.npm_package_install_addons_usesNapi === 'true');
+
+const localModuleABIVer = process.versions.modules;
+const localNapiVer = +process.versions.napi;
+const localArch = (overrideArch || process.arch);
+let localOS = process.platform;
+let localOSVer;
+let localLibc = '';
+let localLibcVer;
+if (overridePlatform) {
+  const m = /^([^_]+)(?:(\\d+)[.](\\d+))?$/.exec(overridePlatform);
+  if (m) {
+    const [, name, major, minor] = m;
+    localOS = name;
+    if (major !== undefined && minor !== undefined)
+      localOSVer = { major: +major, minor: +minor };
+  }
+}
+if (overrideLibc) {
+  const m = /^([^_]+)(?:(\\d+)[.](\\d+))?$/.exec(overrideLibc);
+  if (m) {
+    const [, name, major, minor] = m;
+    localLibc = name;
+    if (major !== undefined && minor !== undefined)
+      localLibcVer = { major: +major, minor: +minor };
+  }
+}
+
+const buildDeps = [];
+{
+  const prefix = 'npm_package_install_addons_buildDependencies_';
+  for (const [key, val] of Object.entries(process.env)) {
+    if (key.startsWith(prefix)) {
+      const pkgName = key.slice(prefix.length);
+      const pkgSemver = val;
+      buildDeps.push(`${pkgName}@${pkgSemver}`);
+    }
+  }
+}
+
+if (buildOnly || (typeof binaryRepo !== 'string' || !binaryRepo))
+  return tryBuild();
+
+if (typeof pkgVer !== 'string' || !pkgVer) {
+  log('Missing package version string value');
+  return tryBuild(true);
+}
+
+// Format: v{version}-m{moduleABIVer}-n{napiVer}-{os}-{libc}-{arch}
+const RE_BINARY_FILENAME = new RegExp(
+  `^v${escapeRegExp(pkgVer)}-`
+    + `m${escapeRegExp(localModuleABIVer)}-`
+    + 'n(\\d+)-'
+    + '([^_]+)_(\\d+)[.](\\d+)-'
+    + '([^_]+)_(\\d+)[.](\\d+)-'
+    + escapeRegExp(localArch)
+);
+
+if (!/^[^/]+\/[^/]+$/.test(binaryRepo)) {
+  log(`Malformed binaryRepo value: ${binaryRepo}`);
+  return tryBuild(true);
+}
+
+if (typeof binaryPath !== 'string' || !binaryPath) {
+  log('Missing binaryOutPath string value');
+  return tryBuild(true);
+}
+
+if (!isAbsolute(binaryPath))
+  binaryPath = resolve(process.cwd(), binaryPath);
+
+// Prepare the directory where the binary will be stored
+{
+  const binaryDir = dirname(binaryPath);
+  try {
+    mkdirSync(binaryDir, { recursive: true });
+  } catch (ex) {
+    log(
+      `Unable to create binary directory (${binaryDir}): ${ex.message}`
+    );
+    return tryBuild(true);
+  }
+}
+
+// Get the system OS version
+if (localOSVer === undefined)
+  localOSVer = getOSVer();
+if (localOSVer === undefined) {
+  log('OS version could not be determined');
+  return tryBuild(true);
+}
+
+// TODO: add support for more exotic platforms supported by node
+// Get system libc name and version
+switch (localOS) {
+  case 'linux': {
+    let localLibcFullVer;
+    const getconf = spawnSync('getconf',
+                              ['GNU_LIBC_VERSION'],
+                              { encoding: 'utf8' });
+    if (getconf.status === 0) {
+      localLibc = 'glibc';
+      localLibcFullVer = /^glibc (\d+[.]\d+)/.exec(getconf.stdout.trim());
+      if (localLibcFullVer)
+        localLibcFullVer = localLibcFullVer[1];
+    } else {
+      const RE_LDD_LIBC = /glibc|gnu libc|musl/i;
+      const ldd = spawnSync('ldd', ['--version'], { encoding: 'utf8' });
+      let m;
+      let lines;
+      if (m = RE_LDD_LIBC.exec(ldd.stdout)) {
+        localLibc = m[0].toLowerCase();
+        lines = ldd.stdout.split(/\r?\n/g);
+      } else if (m = RE_LDD_LIBC.exec(ldd.stderr)) {
+        localLibc = m[0].toLowerCase();
+        lines = ldd.stderr.split(/\r?\n/g);
+      }
+      switch (localLibc.toLowerCase()) {
+        case 'gnu libc':
+        case 'glibc': {
+          m = /^ldd \([^)]*\) (\d+[.]\d+)/i.exec(lines[0]);
+          if (m) {
+            localLibcFullVer = m[1];
+            localLibc = 'glibc';
+          } else {
+            localLibc = '';
+          }
+          break;
+        }
+        case 'musl': {
+          m = /^Version (\d+[.]\d+)/i.exec(lines[1]);
+          if (m) {
+            localLibcFullVer = m[1];
+            localLibc = 'musl';
+          } else {
+            localLibc = '';
+          }
+          break;
+        }
+      }
+    }
+
+    if (!localLibc) {
+      log('Could not detect libc family');
+      return tryBuild(true);
+    }
+
+    const m = RE_VER_MAJOR_MINOR.exec(localLibcFullVer);
+    if (!m) {
+      log(
+        `Could not detect libc major and minor versions in: ${localLibcFullVer}`
+      );
+      return tryBuild(true);
+    }
+    localLibcVer = { major: +m[1], minor: +m[2] };
+    break;
+  }
+  case 'darwin':
+    // Only support macOS (bsd-based) libc for now and tie it to OS version as
+    // it doesn't seem to use independent/separate versioning compared to the OS
+    // itself
+    localLibc = 'bsd';
+    localLibcVer = localOSVer;
+    break;
+  case 'win32':
+    // Only support VC for now
+    localLibc = 'vc';
+    // Windows can support multiple libc versions, so we fetch the installed
+    // versions as needed
+    break;
+  default: {
+    if (/bsd/i.test(localOS)) {
+      // BSD libc seems to be tied to the OS version, so we'll use that
+      localLibc = 'bsd';
+      localLibcVer = localOSVer;
+      break;
+    }
+  }
+}
+
+// Look for the most suitable binary compatible with this system
+fetchAssetList((err, release) => {
+  if (err) {
+    log(`An error occurred while checking for binaries: ${err.message}`);
+    return tryBuild(true);
+  }
+
+  const { binaries } = release;
+
+  if (binaries.length) {
+    // In case there are multiple compatible binaries, choose the "best" one
+    const binary = binaries[0];
+
+    fetchBinary(binary, (err) => {
+      if (err) {
+        log(
+          `Failed to download binary (${binary.downloadURL}): ${err.message}`
+        );
+        return tryBuild(true);
+      }
+      log('Binary downloaded successfully!');
+      process.exit(0);
+    });
+    return;
+  }
+
+  log('No compatible binary found');
+  tryBuild(true);
+});

@@ -1,0 +1,38 @@
+{
+  "name": "install-addons",
+  "version": "0.0.0",
+  "author": "Brian White <mscdex@mscdex.net>",
+  "description": "A program to install precompiled node addons from Github",
+  "main": "./lib/index",
+  "bin": {
+    "node-install-addons": "./bin/node-install-addons"
+  },
+  "dependencies": {
+    "tar": "^6.1.11"
+  },
+  "devDependencies": {
+    "@mscdex/eslint-config": "^1.1.0",
+    "eslint": "^7.0.0"
+  },
+  "scripts": {
+    "lint": "eslint --cache --report-unused-disable-directives --ext=.js . bin/node-install-addons",
+    "lint:fix": "npm run lint -- --fix"
+  },
+  "engines": {
+    "node": ">=10.0.0"
+  },
+  "keywords": [
+    "precompiled",
+    "addons",
+    "install",
+    "binaries"
+  ],
+  "licenses": [{
+    "type": "MIT",
+    "url": "https://github.com/mscdex/install-addons/raw/master/LICENSE"
+  }],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mscdex/install-addons.git"
+  }
+}
