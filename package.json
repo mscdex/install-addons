@@ -1,6 +1,6 @@
 {
   "name": "install-addons",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "author": "Brian White <mscdex@mscdex.net>",
   "description": "A program to install precompiled node addons from Github",
   "main": "./lib/index",
