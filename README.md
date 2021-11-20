@@ -66,12 +66,15 @@ How to Use
 CLI Parameters
 ==============
 
+These are parameters that you can specify in your npm install command.
+
 * `--fallback-to-build` - Attempts to build the addon locally if a binary cannot
-  be found.
+  be found. The default behavior is to not fallback to building.
 
 * `--build-from-source[=<string>]` - If a string value is given, it builds from
   source only for the specified (comma-separated) packages that
-  use `install-addons`.
+  use `install-addons`. If no string value is given, then it builds from source
+  for all packages that use `install-addons`.
 
 * `--silent-build` - Be less noisy with log output
 
