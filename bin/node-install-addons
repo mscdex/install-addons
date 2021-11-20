@@ -428,7 +428,6 @@ function tryBuild(isFallback) {
         return;
       }
 
-      log('Fetching minbuild...');
       fetchMinbuild(minbuild, (err) => {
         if (err) {
           log(`An error occurred while retrieving minbuild: ${err.message}`);
