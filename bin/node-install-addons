@@ -27,7 +27,8 @@ const tar = require('tar');
 
 const MAX_REDIRECTS = 5;
 
-const RE_VER_MAJOR_MINOR = /^(\d+)[.](\d+)/;
+const RE_OS_VER = /^(\d+)[.](\d+)/;
+const RE_LIBC_VER = /^(\d+)[.](\d+)(?:[.](\d+))?/;
 
 function log(...args) {
   console.log('[install-addons]', ...args);
@@ -136,7 +137,7 @@ const getVCRuntimes = (() => {
         if (minor < 10)
           minor *= 10;
 
-        ret.push({ major: +m[1], minor: +m[2] });
+        ret.push({ major: +m[1], minor: +m[2], patch: 0 });
       }
     }
     return (cache = ret);
@@ -147,13 +148,15 @@ function escapeRegExp(string) {
   return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-function versionMatches(localMajor, localMinor, remoteMajor, remoteMinor) {
-  return (localMajor > remoteMajor
-          || (localMajor === remoteMajor
-              && localMinor >= remoteMinor));
+function versionMatches(local, remote) {
+  if (local.major > remote.major)
+    return true;
+  if (local.minor > remote.minor)
+    return true;
+  return (local.patch >= remote.patch);
 }
 
-function isCompatibleLibc(remoteName, remoteMajor, remoteMinor) {
+function isCompatibleLibc(remoteName, remoteVersion) {
   if (localLibc !== remoteName)
     return false;
 
@@ -161,25 +164,18 @@ function isCompatibleLibc(remoteName, remoteMajor, remoteMinor) {
     case 'win32': {
       // MS currently implies a trailing zero in the minor version when there
       // is only one digit, so we make that adjustment here.
-      if (remoteMinor < 10)
-        remoteMinor *= 10;
+      if (remoteVersion.minor < 10)
+        remoteVersion.minor *= 10;
 
       const localVCVersions = getVCRuntimes();
       for (const localVer of localVCVersions) {
-        if (versionMatches(localVer.major,
-                           localVer.minor,
-                           remoteMajor,
-                           remoteMinor)) {
+        if (versionMatches(localVer, remoteVersion))
           return true;
-        }
       }
       break;
     }
     default:
-      return versionMatches(localLibcVer.major,
-                            localLibcVer.minor,
-                            remoteMajor,
-                            remoteMinor);
+      return versionMatches(localLibcVer, remoteVersion);
   }
 
   return false;
@@ -199,6 +195,7 @@ function parseBinaryFilename(filename) {
     libcName: m[f++],
     libcMajor: +m[f++],
     libcMinor: +m[f++],
+    libcPatch: +(m[f++] || '0'),
   };
 }
 
@@ -215,6 +212,7 @@ function isSuitableBinary(filename) {
     libcName,
     libcMajor,
     libcMinor,
+    libcPatch,
   } = info;
 
   // Check napi version (if applicable)
@@ -229,7 +227,12 @@ function isSuitableBinary(filename) {
   }
 
   // Check C/C++ runtime
-  return isCompatibleLibc(libcName, libcMajor, libcMinor);
+  const libcVer = {
+    major: libcMajor,
+    minor: libcMinor,
+    patch: libcPatch,
+  };
+  return isCompatibleLibc(libcName, libcVer);
 }
 
 function getOSVer() {
@@ -248,7 +251,7 @@ function getOSVer() {
     default:
       ver = getOSRelease();
   }
-  const m = RE_VER_MAJOR_MINOR.exec(ver);
+  const m = RE_OS_VER.exec(ver);
   if (m)
     return { major: +m[1], minor: +m[2] };
 }
@@ -823,24 +826,31 @@ const fetchAssetList = (() => {
 
           if (infoA.napiVer < infoB.napiVer)
             return 1;
-          else if (infoA.napiVer > infoB.napiVer)
+          if (infoA.napiVer > infoB.napiVer)
             return -1;
-          else if (infoA.osMajor < infoB.osMajor)
+
+          if (infoA.osMajor < infoB.osMajor)
             return 1;
-          else if (infoA.osMajor > infoB.osMajor)
+          if (infoA.osMajor > infoB.osMajor)
             return -1;
-          else if (infoA.osMinor < infoB.osMinor)
+          if (infoA.osMinor < infoB.osMinor)
             return 1;
-          else if (infoA.osMinor > infoB.osMinor)
+          if (infoA.osMinor > infoB.osMinor)
             return -1;
-          else if (infoA.libcMajor < infoB.libcMajor)
+
+          if (infoA.libcMajor < infoB.libcMajor)
             return 1;
-          else if (infoA.libcMajor > infoB.libcMajor)
+          if (infoA.libcMajor > infoB.libcMajor)
             return -1;
-          else if (infoA.libcMinor < infoB.libcMinor)
+          if (infoA.libcMinor < infoB.libcMinor)
             return 1;
-          else if (infoA.libcMinor > infoB.libcMinor)
+          if (infoA.libcMinor > infoB.libcMinor)
             return -1;
+          if (infoA.libcPatch < infoB.libcPatch)
+            return 1;
+          if (infoA.libcPatch > infoB.libcPatch)
+            return -1;
+
           return 0;
         });
       }
@@ -906,7 +916,7 @@ let localOSVer;
 let localLibc = '';
 let localLibcVer;
 if (overridePlatform) {
-  const m = /^([^_]+)(?:(\\d+)[.](\\d+))?$/.exec(overridePlatform);
+  const m = /^([^_]+)(?:_(\d+)[.](\d+))?$/.exec(overridePlatform);
   if (m) {
     const [, name, major, minor] = m;
     localOS = name;
@@ -915,12 +925,12 @@ if (overridePlatform) {
   }
 }
 if (overrideLibc) {
-  const m = /^([^_]+)(?:(\\d+)[.](\\d+))?$/.exec(overrideLibc);
+  const m = /^([^_]+)(?:_(\d+)[.](\d+)(?:[.](\d+))?)?$/.exec(overrideLibc);
   if (m) {
-    const [, name, major, minor] = m;
+    const [, name, major, minor, patch] = m;
     localLibc = name;
     if (major !== undefined && minor !== undefined)
-      localLibcVer = { major: +major, minor: +minor };
+      localLibcVer = { major: +major, minor: +minor, patch: +(patch || '0') };
   }
 }
 
@@ -945,7 +955,7 @@ const RE_BINARY_FILENAME = new RegExp(
     + `m${escapeRegExp(localModuleABIVer)}-`
     + 'n(\\d+)-'
     + '([^_]+)_(\\d+)[.](\\d+)-'
-    + '([^_]+)_(\\d+)[.](\\d+)-'
+    + '([^_]+)_(\\d+)[.](\\d+)[.](\\d+)-'
     + escapeRegExp(localArch)
 );
 
@@ -991,7 +1001,8 @@ switch (localOS) {
                               { encoding: 'utf8' });
     if (getconf.status === 0) {
       localLibc = 'glibc';
-      localLibcFullVer = /^glibc (\d+[.]\d+)/.exec(getconf.stdout.trim());
+      localLibcFullVer =
+        /^glibc (\d+[.]\d+(?:[.]\d+)?)/.exec(getconf.stdout.trim());
       if (localLibcFullVer)
         localLibcFullVer = localLibcFullVer[1];
     } else {
@@ -1009,7 +1020,7 @@ switch (localOS) {
       switch (localLibc.toLowerCase()) {
         case 'gnu libc':
         case 'glibc': {
-          m = /^ldd \([^)]*\) (\d+[.]\d+)/i.exec(lines[0]);
+          m = /^ldd \([^)]*\) (\d+[.]\d+(?:[.]\d+)?)/i.exec(lines[0]);
           if (m) {
             localLibcFullVer = m[1];
             localLibc = 'glibc';
@@ -1019,7 +1030,7 @@ switch (localOS) {
           break;
         }
         case 'musl': {
-          m = /^Version (\d+[.]\d+)/i.exec(lines[1]);
+          m = /^Version (\d+[.]\d+(?:[.]\d+)?)/i.exec(lines[1]);
           if (m) {
             localLibcFullVer = m[1];
             localLibc = 'musl';
@@ -1036,14 +1047,17 @@ switch (localOS) {
       return tryBuild(true);
     }
 
-    const m = RE_VER_MAJOR_MINOR.exec(localLibcFullVer);
+    const m = RE_LIBC_VER.exec(localLibcFullVer);
     if (!m) {
       log(
         `Could not detect libc major and minor versions in: ${localLibcFullVer}`
       );
       return tryBuild(true);
     }
-    localLibcVer = { major: +m[1], minor: +m[2] };
+    {
+      const [, major, minor, patch] = m;
+      localLibcVer = { major: +major, minor: +minor, patch: +(patch || '0') };
+    }
     break;
   }
   case 'darwin':
