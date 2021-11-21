@@ -861,34 +861,38 @@ const fetchAssetList = (() => {
   };
 })();
 
+const pkg = require(join(process.cwd(), 'package.json'));
+
 let buildOnly = false;
-if (process.env.npm_config_build_from_source) {
+if (typeof process.env.npm_config_build_from_source === 'string') {
   switch (process.env.npm_config_build_from_source) {
     case 'true':
       buildOnly = true;
       break;
+    case '':
     case 'false':
       buildOnly = false;
       break;
     default: {
       const vals = process.env.npm_config_build_from_source.split(',');
-      buildOnly = vals.includes(process.env.npm_package_name);
+      buildOnly = vals.includes(pkg.name);
     }
   }
 }
 
 let fallbackBuild = true;
-if (process.env.npm_config_fallback_to_build) {
+if (typeof process.env.npm_config_fallback_to_build === 'string') {
   switch (process.env.npm_config_fallback_to_build) {
     case 'true':
       fallbackBuild = true;
       break;
+    case '':
     case 'false':
       fallbackBuild = false;
       break;
     default: {
       const vals = process.env.npm_config_fallback_to_build.split(',');
-      fallbackBuild = vals.includes(process.env.npm_package_name);
+      fallbackBuild = vals.includes(pkg.name);
     }
   }
 }
@@ -898,15 +902,16 @@ const overrideArch = process.env.npm_config_override_arch;
 const overrideLibc = process.env.npm_config_override_libc;
 const overridePlatform = process.env.npm_config_override_platform;
 const npmPath = process.env.npm_execpath;
-const pkgVer = process.env.npm_package_version;
-const binaryRepo = process.env.npm_package_install_addons_binaryRepo;
-let binaryPath = process.env.npm_package_install_addons_binaryOutPath;
-const prebuildCommand = process.env.npm_package_install_addons_preBuildCommand;
-const buildCommand = process.env.npm_package_install_addons_buildCommand;
-const noMinbuild = (
-  process.env.npm_package_install_addons_noMinbuild === 'true'
-);
-const usesNapi = (process.env.npm_package_install_addons_usesNapi === 'true');
+const pkgVer = pkg.version;
+const cfg = pkg['install-addons'];
+if (typeof cfg !== 'object' || cfg === null)
+  throw new Error(`Missing 'install-addons' object in package.json`);
+const binaryRepo = cfg.binaryRepo;
+let binaryPath = cfg.binaryOutPath;
+const prebuildCommand = cfg.preBuildCommand;
+const buildCommand = cfg.buildCommand;
+const noMinbuild = (cfg.noMinbuild === true);
+const usesNapi = (cfg.usesNapi === true);
 
 const localModuleABIVer = process.versions.modules;
 const localNapiVer = +process.versions.napi;
@@ -935,15 +940,10 @@ if (overrideLibc) {
 }
 
 const buildDeps = [];
-{
-  const prefix = 'npm_package_install_addons_buildDependencies_';
-  for (const [key, val] of Object.entries(process.env)) {
-    if (key.startsWith(prefix)) {
-      const pkgName = key.slice(prefix.length);
-      const pkgSemver = val;
-      buildDeps.push(`${pkgName}@${pkgSemver}`);
-    }
-  }
+if (typeof cfg.buildDependencies === 'object'
+    && cfg.buildDependencies !== null) {
+  for (const [pkgName, pkgSemver] of Object.entries(cfg.buildDependencies))
+    buildDeps.push(`${pkgName}@${pkgSemver}`);
 }
 
 if (typeof pkgVer !== 'string' || !pkgVer)
@@ -955,7 +955,7 @@ const RE_BINARY_FILENAME = new RegExp(
     + `m${escapeRegExp(localModuleABIVer)}-`
     + 'n(\\d+)-'
     + '([^_]+)_(\\d+)[.](\\d+)-'
-    + '([^_]+)_(\\d+)[.](\\d+)[.](\\d+)-'
+    + '([^_]+)_(\\d+)[.](\\d+)(?:[.](\\d+))?-'
     + escapeRegExp(localArch)
 );
 
