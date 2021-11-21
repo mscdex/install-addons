@@ -81,7 +81,7 @@ These are parameters that you can specify in your npm install command.
   use `install-addons`. If the value is `'false'`, the behavior is disabled for
   all packages that use `install-addons`. If the value `'true'` or no string
   value is given, then it falls back to building from source for all packages
-  that use `install-addons`. The default behavior is to not fallback to
+  that use `install-addons`. **Note:** The default behavior is to fallback to
   building.
 
 * `--override-arch=<string>` - Overrides the local host architecture with the
