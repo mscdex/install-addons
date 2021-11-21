@@ -68,23 +68,35 @@ CLI Parameters
 
 These are parameters that you can specify in your npm install command.
 
-* `--fallback-to-build` - Attempts to build the addon locally if a binary cannot
-  be found. The default behavior is to not fallback to building.
-
 * `--build-from-source[=<string>]` - If a string value is given, it builds from
-  source only for the specified (comma-separated) packages that
-  use `install-addons`. If no string value is given, then it builds from source
-  for all packages that use `install-addons`.
+  source only for the specified (comma-separated) packages that use
+  `install-addons`. If the value is `'false'`, the behavior is disabled for all
+  packages that use `install-addons`. If the value `'true'` or no string value
+  is given, then it builds from source for all packages that use
+  `install-addons`.
 
-* `--silent-build` - Be less noisy with log output
+* `--fallback-to-build[=<string>]` - Attempts to build the addon locally only if
+  a compatible binary cannot be found. If a string value is given, it falls back
+  to building from source only for the specified (comma-separated) packages that
+  use `install-addons`. If the value is `'false'`, the behavior is disabled for
+  all packages that use `install-addons`. If the value `'true'` or no string
+  value is given, then it falls back to building from source for all packages
+  that use `install-addons`. The default behavior is to not fallback to
+  building.
 
-* `--override-arch=<string>` - String containing the arch name
+* `--override-arch=<string>` - Overrides the local host architecture with the
+  architecture given in the specified string.
 
-* `--override-libc=<string>` - String containing the libc name
-  or `{name}_{major.minor}`
+* `--override-libc=<string>` - Overrides the local host libc with the
+  libc given in the specified string. This string can contain the libc name
+  or be of the format: `{name}_{majorVersion.minorVersion}`.
 
-* `--override-platform=<string>` - String containing the platform name
-  or `{name}_{major.minor}`
+* `--override-platform=<string>` - Overrides the local host platform with the
+  platform given in the specified string. This string can contain the platform
+  name or be of the format: `{name}_{majorVersion.minorVersion}`.
+
+* `--silent-build` - When building from source, no compilation output will be
+  logged.
 
 
 [build-addons]: https://github.com/mscdex/build-addons
