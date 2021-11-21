@@ -857,15 +857,33 @@ if (process.env.npm_config_build_from_source) {
     case 'true':
       buildOnly = true;
       break;
+    case 'false':
+      buildOnly = false;
+      break;
     default: {
-      buildOnly = process.env.npm_package_name.split(',').includes(
-        process.env.npm_package_name
-      );
+      const vals = process.env.npm_config_build_from_source.split(',');
+      buildOnly = vals.includes(process.env.npm_package_name);
     }
   }
 }
+
+let fallbackBuild = true;
+if (process.env.npm_config_fallback_to_build) {
+  switch (process.env.npm_config_fallback_to_build) {
+    case 'true':
+      fallbackBuild = true;
+      break;
+    case 'false':
+      fallbackBuild = false;
+      break;
+    default: {
+      const vals = process.env.npm_config_fallback_to_build.split(',');
+      fallbackBuild = vals.includes(process.env.npm_package_name);
+    }
+  }
+}
+
 const noBuildOutput = (process.env.npm_config_silent_build === 'true');
-const fallbackBuild = (process.env.npm_config_fallback_to_build === 'true');
 const overrideArch = process.env.npm_config_override_arch;
 const overrideLibc = process.env.npm_config_override_libc;
 const overridePlatform = process.env.npm_config_override_platform;
